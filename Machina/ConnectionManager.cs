@@ -32,9 +32,19 @@ namespace Machina
 
         private readonly ProcessTCPInfo _processTCPInfo = new ProcessTCPInfo();
         private bool _disposedValue;
+        private readonly bool _isWindows;
+        private byte _refreshAge;
+
+        public ConnectionManager()
+        {
+            _isWindows = RawCaptureSocket.IsWindows();
+        }
 
         public void Refresh()
         {
+            if ((unchecked(_refreshAge++) != 0) && !_isWindows)
+                return;
+
             // Update any filters
             _processTCPInfo.ProcessID = Config.ProcessID;
             _processTCPInfo.ProcessIDList = Config.ProcessIDList;

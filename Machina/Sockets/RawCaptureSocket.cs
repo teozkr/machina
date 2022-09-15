@@ -100,7 +100,7 @@ namespace Machina.Sockets
             return socket;
         }
 
-        private static bool IsWindows()
+        internal static bool IsWindows()
         {
             const string WINE_ENV_VAR = "FORCE_MACHINA_RAW_SOCKET_WINE_COMPAT";
 
