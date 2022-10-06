@@ -16,9 +16,11 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Linq;
 
 namespace Machina.Infrastructure
 {
@@ -125,6 +127,55 @@ namespace Machina.Infrastructure
             return processIDList;
         }
 
+        public static string GetUnixProcessPathForFFXIV()
+        {
+            foreach (string processDir in Directory.GetDirectories("/proc"))
+            {
+                uint processId;
+                if (!uint.TryParse(Path.GetFileName(processDir), out processId))
+                {
+                    continue;
+                }
+                string processStatFile = File.ReadAllText(Path.Combine(processDir, "stat"));
+                string[] processStatClauses = processStatFile.Split(' ');
+                if (processStatClauses.Length > 1 && processStatClauses[1] == "(ffxiv_dx11.exe)")
+                {
+                    return processDir;
+                }
+            }
+            return null;
+        }
+
+        public struct SockAddr
+        {
+            public uint Ip;
+            public ushort Port;
+        }
+        public struct SockAddrPair
+        {
+            public SockAddr Local;
+            public SockAddr Remote;
+
+            public bool MatchesConnection(TCPConnection conn)
+            {
+                return conn.LocalIP == Local.Ip
+                && conn.LocalPort == Local.Port
+                && conn.RemoteIP == Remote.Ip
+                && conn.RemotePort == Remote.Port;
+            }
+        }
+
+        public static SockAddr ParseLinuxHexSocketAddress(string addr)
+        {
+            string[] addrComponents = addr.Split(':');
+            string ipHex = addrComponents[0];
+            string portHex = addrComponents[1];
+            uint ip = uint.Parse(ipHex, System.Globalization.NumberStyles.AllowHexSpecifier);
+            ushort port = ushort.Parse(portHex, System.Globalization.NumberStyles.AllowHexSpecifier);
+            //ushort port = (ushort)IPAddress.NetworkToHostOrder((short)ushort.Parse(portHex, System.Globalization.NumberStyles.AllowHexSpecifier));
+            return new SockAddr { Ip = ip, Port = port };
+        }
+
         /// <summary>
         /// This retrieves all current TCPIP connections, filters them based on a process id (specified by either ProcessID, ProcessWindowName or ProcessWindowClass parameter),
         ///   and updates the connections collection.
@@ -142,6 +193,90 @@ namespace Machina.Infrastructure
                 _processFilterList.AddRange(GetProcessIDByWindow(ProcessWindowClass, null));
             else if (!string.IsNullOrWhiteSpace(ProcessWindowName))
                 _processFilterList.AddRange(GetProcessIDByWindow(null, ProcessWindowName));
+
+            string ffxivProcess = GetUnixProcessPathForFFXIV();
+            if (ffxivProcess == null)
+            {
+                connections.Clear();
+                return;
+            }
+            string[] processTcpSocketsFile = File.ReadAllLines(Path.Combine(ffxivProcess, "net/tcp"));
+            int currentHeaderIndex = 0;
+            int localAddrIndex = -1;
+            int remoteAddrIndex = -1;
+            foreach (string header in processTcpSocketsFile[0].Split(' '))
+            {
+                if (header == "local_address")
+                {
+                    localAddrIndex = currentHeaderIndex;
+                }
+                if (header == "rem_address")
+                {
+                    remoteAddrIndex = currentHeaderIndex;
+                }
+                if (header.Length > 0)
+                {
+                    currentHeaderIndex++;
+                }
+            }
+            List<SockAddrPair> connectionPairs = new List<SockAddrPair>();
+            foreach (string line in processTcpSocketsFile.Skip(1))
+            {
+                int currentFieldIndex = 0;
+                SockAddrPair addresses = new SockAddrPair();
+                foreach (string field in line.Split(' '))
+                {
+                    if (currentFieldIndex == localAddrIndex)
+                    {
+                        addresses.Local = ParseLinuxHexSocketAddress(field);
+                    }
+                    if (currentFieldIndex == remoteAddrIndex)
+                    {
+                        addresses.Remote = ParseLinuxHexSocketAddress(field);
+                    }
+
+                    if (field.Length > 0)
+                    {
+                        currentFieldIndex++;
+                    }
+                }
+                connectionPairs.Add(addresses);
+            }
+
+            foreach (SockAddrPair connPair in connectionPairs)
+            {
+                if (connPair.Local.Ip != 0 && !connections.Any(connPair.MatchesConnection))
+                {
+                    TCPConnection connection = new TCPConnection()
+                    {
+                        LocalIP = connPair.Local.Ip,
+                        RemoteIP = connPair.Remote.Ip,
+                        LocalPort = connPair.Local.Port,
+                        RemotePort = connPair.Remote.Port,
+                        ProcessId = _processFilterList[0],
+                    };
+
+                    connections.Add(connection);
+
+                    Trace.WriteLine($"ProcessTCPInfo: New connection detected for Process {connection}", "DEBUG-MACHINA");
+                }
+            }
+            for (int i = 0; i < connections.Count; i++)
+            {
+                TCPConnection connection = connections[i];
+                if (!connectionPairs.Any(connPair => connPair.MatchesConnection(connection)))
+                {
+                    Trace.WriteLine($"ProcessTCPInfo: Removing connection {connections[i]}", "DEBUG-MACHINA");
+                    connections[i].Socket?.StopCapture();
+                    connections[i].Socket?.Dispose();
+                    connections[i].Socket = null;
+                    connections.RemoveAt(i);
+                    i--;
+                }
+            }
+
+            return;
+
 
             if (_processFilterList.Count == 0)
             {
@@ -170,7 +305,9 @@ namespace Machina.Infrastructure
             // attempt to allocate 5 times, in case there are frequent increases in the # of tcp connections
             for (int i = 0; i < 5; i++)
             {
+                Console.WriteLine($"Getting TCP table to {ptrTCPTable}/{bufferLength}");
                 ret = GetExtendedTcpTable(ptrTCPTable, ref bufferLength, false, AF_INET, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0);
+                Console.WriteLine($"Completed, table at {ptrTCPTable}/{bufferLength}, result = {ret}");
 
                 if (ret == 0)
                     break;
@@ -284,7 +421,7 @@ namespace Machina.Infrastructure
             }
             finally
             {
-                Marshal.FreeHGlobal(ptrTCPTable);
+                //Marshal.FreeHGlobal(ptrTCPTable);
             }
         }
     }
