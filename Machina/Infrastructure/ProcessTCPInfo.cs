@@ -18,6 +18,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Http;
+using System.Net.Http.Json;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Linq;
@@ -97,6 +99,8 @@ namespace Machina.Infrastructure
         public IPAddress LocalIP
         { get; set; } = IPAddress.None;
 
+        private HttpClient http = new HttpClient();
+
 
         [DllImport("user32.dll", EntryPoint = "FindWindow", CharSet = CharSet.Unicode)]
         private static extern IntPtr FindWindow(string sClass, string sWindow);
@@ -127,34 +131,15 @@ namespace Machina.Infrastructure
             return processIDList;
         }
 
-        public static string GetUnixProcessPathForFFXIV()
-        {
-            foreach (string processDir in Directory.GetDirectories("/proc"))
-            {
-                uint processId;
-                if (!uint.TryParse(Path.GetFileName(processDir), out processId))
-                {
-                    continue;
-                }
-                string processStatFile = File.ReadAllText(Path.Combine(processDir, "stat"));
-                string[] processStatClauses = processStatFile.Split(' ');
-                if (processStatClauses.Length > 1 && processStatClauses[1] == "(ffxiv_dx11.exe)")
-                {
-                    return processDir;
-                }
-            }
-            return null;
-        }
-
         public struct SockAddr
         {
-            public uint Ip;
-            public ushort Port;
+            public uint Ip { get; set; }
+            public ushort Port { get; set; }
         }
         public struct SockAddrPair
         {
-            public SockAddr Local;
-            public SockAddr Remote;
+            public SockAddr Local { get; set; }
+            public SockAddr Remote { get; set; }
 
             public bool MatchesConnection(TCPConnection conn)
             {
@@ -163,17 +148,6 @@ namespace Machina.Infrastructure
                 && conn.RemoteIP == Remote.Ip
                 && conn.RemotePort == Remote.Port;
             }
-        }
-
-        public static SockAddr ParseLinuxHexSocketAddress(string addr)
-        {
-            string[] addrComponents = addr.Split(':');
-            string ipHex = addrComponents[0];
-            string portHex = addrComponents[1];
-            uint ip = uint.Parse(ipHex, System.Globalization.NumberStyles.AllowHexSpecifier);
-            ushort port = ushort.Parse(portHex, System.Globalization.NumberStyles.AllowHexSpecifier);
-            //ushort port = (ushort)IPAddress.NetworkToHostOrder((short)ushort.Parse(portHex, System.Globalization.NumberStyles.AllowHexSpecifier));
-            return new SockAddr { Ip = ip, Port = port };
         }
 
         /// <summary>
@@ -194,54 +168,8 @@ namespace Machina.Infrastructure
             else if (!string.IsNullOrWhiteSpace(ProcessWindowName))
                 _processFilterList.AddRange(GetProcessIDByWindow(null, ProcessWindowName));
 
-            string ffxivProcess = GetUnixProcessPathForFFXIV();
-            if (ffxivProcess == null)
-            {
-                connections.Clear();
-                return;
-            }
-            string[] processTcpSocketsFile = File.ReadAllLines(Path.Combine(ffxivProcess, "net/tcp"));
-            int currentHeaderIndex = 0;
-            int localAddrIndex = -1;
-            int remoteAddrIndex = -1;
-            foreach (string header in processTcpSocketsFile[0].Split(' '))
-            {
-                if (header == "local_address")
-                {
-                    localAddrIndex = currentHeaderIndex;
-                }
-                if (header == "rem_address")
-                {
-                    remoteAddrIndex = currentHeaderIndex;
-                }
-                if (header.Length > 0)
-                {
-                    currentHeaderIndex++;
-                }
-            }
-            List<SockAddrPair> connectionPairs = new List<SockAddrPair>();
-            foreach (string line in processTcpSocketsFile.Skip(1))
-            {
-                int currentFieldIndex = 0;
-                SockAddrPair addresses = new SockAddrPair();
-                foreach (string field in line.Split(' '))
-                {
-                    if (currentFieldIndex == localAddrIndex)
-                    {
-                        addresses.Local = ParseLinuxHexSocketAddress(field);
-                    }
-                    if (currentFieldIndex == remoteAddrIndex)
-                    {
-                        addresses.Remote = ParseLinuxHexSocketAddress(field);
-                    }
-
-                    if (field.Length > 0)
-                    {
-                        currentFieldIndex++;
-                    }
-                }
-                connectionPairs.Add(addresses);
-            }
+            // connect to privileged netstatd helper
+            List<SockAddrPair> connectionPairs = http.GetFromJsonAsync<List<SockAddrPair>>("http://127.0.0.1:9678/sockets").Result;
 
             foreach (SockAddrPair connPair in connectionPairs)
             {
